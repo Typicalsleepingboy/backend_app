@@ -5,6 +5,9 @@ const bcrypt = require('bcrypt');
 const saltRounds = 10;
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const nodemailer = require('nodemailer');
+const moment = require('moment-timezone');
+const { Twilio } = require("twilio");
 
 const app = express();
 app.use(cors());
@@ -41,6 +44,10 @@ const verifyToken = (req, res, next) => {
   }
 };
 
+const accountSid = process.env.TWILIO_ACCOUNT_SID;
+const authToken = process.env.TWILIO_AUTH_TOKEN;
+const client = new Twilio(accountSid, authToken);
+
 // Define routes here
 //Registrasi Pengguna Baru
 app.post('/auth/register', async (req, res) => {
@@ -55,19 +62,31 @@ app.post('/auth/register', async (req, res) => {
     // Validasi format email
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
-      return res.status(400).send("Format email tidak benar.");
+      return res.status(400).send("Format email yang anda masukkan tidak benar.");
     }
 
     // Mengecek apakah password dan confirmPassword cocok
     if (password !== confirmPassword) {
-      return res.status(400).send("Kata sandi tidak cocok.");
+      return res.status(400).send("Kata sandi yang anda masukkan tidak cocok.");
+    }
+
+    // Mengecek apakah username sudah ada
+    const usernameSnapshot = await db.collection('app_account').where('username', '==', username).get();
+    if (!usernameSnapshot.empty) {
+      return res.status(400).send("Username sudah digunakan oleh pengguna lain.");
+    }
+
+    // Mengecek apakah email sudah ada
+    const emailSnapshot = await db.collection('app_account').where('email', '==', email).get();
+    if (!emailSnapshot.empty) {
+      return res.status(400).send("Email sudah digunakan oleh pengguna lain.");
     }
 
     // Enkripsi password sebelum menyimpan ke database
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
     // Simpan user dengan password yang sudah dienkripsi
-    const newUserRef = await db.collection('users').add({
+    const newUserRef = await db.collection('app_account').add({
       email: email,
       username: username,
       password: hashedPassword
@@ -89,7 +108,7 @@ app.post('/auth/login', async (req, res) => {
     }
 
     // Cari user berdasarkan username
-    const usersRef = db.collection('users');
+    const usersRef = db.collection('app_account');
     const snapshot = await usersRef.where('username', '==', username).get();
     if (snapshot.empty) {
       return res.status(401).send("Username tidak terdaftar.");
@@ -139,7 +158,7 @@ app.post('/auth/logout', verifyToken, async (req, res) => {
     await db.collection('refresh_tokens').doc(userId).delete();
 
     res.status(200).send({
-      message: "Berhasil logout"
+      message: "Anda berhasil logout"
     });
   } catch (error) {
     res.status(500).send(error.message);
@@ -183,7 +202,7 @@ app.put('/users/me', verifyToken, async (req, res) => {
       return res.status(400).send("Setidaknya edit satu data.");
     }
 
-    const userRef = db.collection('users').doc(userId);
+    const userRef = db.collection('app_account').doc(userId);
     const userDoc = await userRef.get();
 
     if (!userDoc.exists) {
@@ -213,11 +232,11 @@ app.put('/users/me/password', verifyToken, async (req, res) => {
     }
 
     if (newPassword !== confirmNewPassword) {
-      return res.status(400).send("Password baru dan konfirmasi password baru tidak cocok.");
+      return res.status(400).send("Kata sandi baru yang anda masukkan tidak cocok.");
     }
 
     // Dapatkan data user
-    const userRef = db.collection('users').doc(userId);
+    const userRef = db.collection('app_account').doc(userId);
     const userDoc = await userRef.get();
 
     if (!userDoc.exists) {
@@ -229,7 +248,7 @@ app.put('/users/me/password', verifyToken, async (req, res) => {
     // Verifikasi current password
     const passwordMatch = await bcrypt.compare(currentPassword, storedPassword);
     if (!passwordMatch) {
-      return res.status(401).send("Kata sandi saat ini salah.");
+      return res.status(401).send("Kata sandi lama yang anda masukkan salah.");
     }
 
     // Hash new password
@@ -238,50 +257,62 @@ app.put('/users/me/password', verifyToken, async (req, res) => {
     // Update password di database
     await userRef.update({ password: hashedNewPassword });
 
-    res.status(200).send({ message: "Berhasil mengubah password" });
+    res.status(200).send({ message: "Anda berhasil mengubah password" });
   } catch (error) {
     res.status(500).send(error.message);
   }
 });
 
-//Mendaftarkan nasabah baru
 app.post('/nasabah', async (req, res) => {
-    try {
-      const { name, phoneNumber, address } = req.body;
-  
-      // Validasi input dasar
-      if (!name || !phoneNumber || !address) {
-        return res.status(400).send("Semua data wajib diisi.");
-      }
-  
-      // Verifikasi bahwa nomor telepon belum terdaftar (opsional)
-      const existingCustomer = await db.collection('customers').where('phoneNumber', '==', phoneNumber).get();
-      if (!existingCustomer.empty) {
-        return res.status(400).send("Nomor sudah dipakai oleh nasabah lain.");
-      }
-  
-      // Simpan data nasabah ke database
-      const newCustomerRef = await db.collection('customers').add({
-        name: name,
-        phoneNumber: phoneNumber,
-        address: address
-      });
-  
-      res.status(201).send({ message: "Berhasil mendaftarkan nasabah baru", customerId: newCustomerRef.id });
-  
-    } catch (error) {
-      res.status(500).send(error.message);
+  try {
+    const { name, phoneNumber, address, email } = req.body;
+
+    // Validasi input dasar
+    if (!name || !phoneNumber || !address || !email) {
+      return res.status(400).send("Semua data wajib diisi.");
     }
+
+    // Verifikasi bahwa nomor telepon belum terdaftar (opsional)
+    const existingCustomerByPhone = await db.collection('nasabah').where('phoneNumber', '==', phoneNumber).get();
+    if (!existingCustomerByPhone.empty) {
+      return res.status(400).send("Nomor sudah dipakai oleh nasabah lain.");
+    }
+
+    // Verifikasi bahwa nama nasabah belum terdaftar
+    const existingCustomerByName = await db.collection('nasabah').where('name', '==', name).get();
+    if (!existingCustomerByName.empty) {
+      return res.status(400).send("Nama sudah dipakai oleh nasabah lain.");
+    }
+
+    // Verifikasi bahwa email belum terdaftar (opsional)
+    const existingCustomerByEmail = await db.collection('nasabah').where('email', '==', email).get();
+    if (!existingCustomerByEmail.empty) {
+      return res.status(400).send("Email sudah dipakai oleh nasabah lain.");
+    }
+
+    // Simpan data nasabah ke database
+    const newCustomerRef = await db.collection('nasabah').add({
+      name: name,
+      phoneNumber: phoneNumber,
+      address: address,
+      email: email
+    });
+
+    res.status(201).send({ message: "Berhasil registrasi nasabah baru", customerId: newCustomerRef.id });
+
+  } catch (error) {
+    res.status(500).send(error.message);
+  }
 });
 
 //Mendapatkan seluruh data nasabah
 app.get('/nasabah', async (req, res) => {
     try {
-      const customersRef = db.collection('customers');
+      const customersRef = db.collection('nasabah');
       const snapshot = await customersRef.get();
   
       if (snapshot.empty) {
-        return res.status(404).send("Tidak ada nasabah.");
+        return res.status(404).send("Tidak ditemukan data nasabah.");
       }
   
       let customers = [];
@@ -297,13 +328,30 @@ app.get('/nasabah', async (req, res) => {
     }
 });
 
+app.get('/jumlahnasabah', async (req, res) => {
+  try {
+      const customersRef = db.collection('nasabah');
+      const snapshot = await customersRef.get();
+
+      if (snapshot.empty) {
+          return res.status(404).send("Tidak ditemukan data nasabah.");
+      }
+
+      const jumlahNasabah = snapshot.size; // Menghitung jumlah dokumen
+
+      res.status(200).send({ jumlahNasabah });
+  } catch (error) {
+      res.status(500).send(error.message);
+  }
+});
+
 // Mendapatkan detail data nasabah
 app.get('/nasabah/:id', async (req, res) => {
   try {
     const customerId = req.params.id;
 
     // Ambil data nasabah berdasarkan ID
-    const customerRef = db.collection('customers').doc(customerId);
+    const customerRef = db.collection('nasabah').doc(customerId);
     const customerDoc = await customerRef.get();
 
     if (!customerDoc.exists) {
@@ -322,11 +370,11 @@ app.get('/nasabah/:id', async (req, res) => {
 //Mendapatkan nama nasabah dari daftar nasabah
 app.get('/nasabah/names', async (req, res) => {
   try {
-    const customersRef = db.collection('customers');
+    const customersRef = db.collection('nasabah');
     const snapshot = await customersRef.get();
 
     if (snapshot.empty) {
-      return res.status(404).send("Nasabah tidak terdaftar.");
+      return res.status(404).send("Tidak ditemukan data nasabah.");
     }
 
     let customerNames = [];
@@ -349,12 +397,12 @@ app.get('/nasabah/search', async (req, res) => {
       return res.status(400).send("Query paramater name harus diberikan.");
     }
 
-    const customersRef = db.collection('customers');
+    const customersRef = db.collection('nasabah');
     const snapshot = await customersRef.get();
 
     if (snapshot.empty) {
       console.log("No documents found in the collection.");
-      return res.status(404).send("No customers found.");
+      return res.status(404).send("Tidak ditemukan data nasabah.");
     }
 
     const regex = new RegExp(name.split(' ').join('|'), 'i');
@@ -382,15 +430,15 @@ app.get('/nasabah/search', async (req, res) => {
 app.put('/nasabah/:id', async (req, res) => {
   try {
     const customerId = req.params.id;
-    const { name, phoneNumber, address } = req.body;
+    const { name, phoneNumber, address, email } = req.body;
 
     // Validasi input dasar
-    if (!name && !phoneNumber && !address) {
-      return res.status(400).send("Setidaknya edit satu data.");
+    if (!name && !phoneNumber && !address && !email) {
+      return res.status(400).send("Setidaknya edit satu data nasabah.");
     }
 
     // Ambil referensi dokumen nasabah berdasarkan ID
-    const customerRef = db.collection('customers').doc(customerId);
+    const customerRef = db.collection('nasabah').doc(customerId);
     const customerDoc = await customerRef.get();
 
     if (!customerDoc.exists) {
@@ -402,21 +450,22 @@ app.put('/nasabah/:id', async (req, res) => {
     if (name) updateData.name = name;
     if (phoneNumber) updateData.phoneNumber = phoneNumber;
     if (address) updateData.address = address;
+    if (email) updateData.email = email;
 
     // Update data nasabah di Firestore
     await customerRef.update(updateData);
 
-    // Update nama dokumen di collection datasaving jika nama berubah
+    // Update nama dokumen di collection saldo_nasabah jika nama berubah
     if (name) {
       const oldName = customerDoc.data().name;
-      const datasavingRef = db.collection('datasaving').doc(oldName);
+      const datasavingRef = db.collection('saldo_nasabah').doc(oldName);
       const datasavingDoc = await datasavingRef.get();
 
       if (datasavingDoc.exists) {
         const { totalBalance } = datasavingDoc.data();
 
         // Buat dokumen baru dengan nama baru dan totalBalance yang sama
-        await db.collection('datasaving').doc(name).set({
+        await db.collection('saldo_nasabah').doc(name).set({
           name: name,
           totalBalance: totalBalance
         });
@@ -438,17 +487,29 @@ app.delete('/nasabah/:id', async (req, res) => {
     const customerId = req.params.id;
 
     // Ambil referensi dokumen nasabah berdasarkan ID
-    const customerRef = db.collection('customers').doc(customerId);
+    const customerRef = db.collection('nasabah').doc(customerId);
     const customerDoc = await customerRef.get();
 
     if (!customerDoc.exists) {
       return res.status(404).send("Nasabah tidak terdaftar.");
     }
 
+    // Ambil nama nasabah untuk digunakan sebagai referensi ID saldo
+    const customerName = customerDoc.data().name;
+
     // Hapus dokumen nasabah dari Firestore
     await customerRef.delete();
 
-    res.status(200).send({ message: "Berhasil menghapus data nasabah", customerId: customerId });
+    // Ambil referensi dokumen saldo nasabah berdasarkan nama nasabah
+    const saldoRef = db.collection('saldo_nasabah').doc(customerName);
+    const saldoDoc = await saldoRef.get();
+
+    if (saldoDoc.exists) {
+      // Hapus dokumen saldo nasabah yang sesuai
+      await saldoRef.delete();
+    }
+
+    res.status(200).send({ message: "Berhasil menghapus data nasabah dan saldo yang sesuai", customerId: customerId });
   } catch (error) {
     res.status(500).send(error.message);
   }
@@ -457,17 +518,17 @@ app.delete('/nasabah/:id', async (req, res) => {
 //Menambahkan jenis sampah
 app.post('/wastetypes', async (req, res) => {
     try {
-      const { name, pricePerGram } = req.body;
+      const { name, pricePer100Gram } = req.body;
   
       // Validasi input dasar
-      if (!name || !pricePerGram) {
-        return res.status(400).send("Semua data wajib diisi.");
+      if (!name || !pricePer100Gram) {
+        return res.status(400).send("Semua data jenis sampah wajib diisi.");
       }
   
       // Simpan data jenis sampah ke database
-      const newWasteTypeRef = await db.collection('waste_types').add({
+      const newWasteTypeRef = await db.collection('jenis_sampah').add({
         name: name,
-        pricePerGram: pricePerGram
+        pricePer100Gram: pricePer100Gram
       });
   
       res.status(201).send({ message: "Berhasil menambahkan jenis sampah", wasteTypeId: newWasteTypeRef.id });
@@ -481,7 +542,7 @@ app.post('/wastetypes', async (req, res) => {
 app.get('/wastetypes', async (req, res) => {
   try {
     // Mengambil semua data jenis sampah dari koleksi 'waste_types'
-    const wasteTypesRef = db.collection('waste_types');
+    const wasteTypesRef = db.collection('jenis_sampah');
     const snapshot = await wasteTypesRef.get();
 
     if (snapshot.empty) {
@@ -511,7 +572,7 @@ app.get('/wastetypes/search', async (req, res) => {
       return res.status(400).send("Query paramater name harus diberikan.");
     }
 
-    const wasteTypesRef = db.collection('waste_types');
+    const wasteTypesRef = db.collection('jenis_sampah');
     const snapshot = await wasteTypesRef.where('name', '==', name).get();
 
     if (snapshot.empty) {
@@ -533,15 +594,15 @@ app.get('/wastetypes/search', async (req, res) => {
 app.put('/wastetypes/:id', async (req, res) => {
   try {
     const wasteTypeId = req.params.id;
-    const { name, pricePerKg } = req.body;
+    const { name, pricePer100Gram } = req.body;
 
     // Validasi input dasar
-    if (!name && !pricePerKg) {
+    if (!name && !pricePer100Gram) {
       return res.status(400).send("Setidaknya edit satu data.");
     }
 
     // Ambil referensi dokumen jenis sampah berdasarkan ID
-    const wasteTypeRef = db.collection('waste_types').doc(wasteTypeId);
+    const wasteTypeRef = db.collection('jenis_sampah').doc(wasteTypeId);
     const wasteTypeDoc = await wasteTypeRef.get();
 
     if (!wasteTypeDoc.exists) {
@@ -551,7 +612,7 @@ app.put('/wastetypes/:id', async (req, res) => {
     // Buat objek update dengan hanya field yang diberikan
     let updateData = {};
     if (name) updateData.name = name;
-    if (pricePerKg) updateData.pricePerKg = pricePerKg;
+    if (pricePer100Gram) updateData.pricePer100Gram = pricePer100Gram;
 
     // Update data jenis sampah di Firestore
     await wasteTypeRef.update(updateData);
@@ -568,7 +629,7 @@ app.delete('/wastetypes/:id', async (req, res) => {
     const wasteTypeId = req.params.id;
 
     // Ambil referensi dokumen jenis sampah berdasarkan ID
-    const wasteTypeRef = db.collection('waste_types').doc(wasteTypeId);
+    const wasteTypeRef = db.collection('jenis_sampah').doc(wasteTypeId);
     const wasteTypeDoc = await wasteTypeRef.get();
 
     if (!wasteTypeDoc.exists) {
@@ -578,13 +639,64 @@ app.delete('/wastetypes/:id', async (req, res) => {
     // Hapus dokumen jenis sampah dari Firestore
     await wasteTypeRef.delete();
 
-    res.status(200).send({ message: "Berhasil menghapus jenis data", wasteTypeId: wasteTypeId });
+    res.status(200).send({ message: "Berhasil menghapus jenis sampah", wasteTypeId: wasteTypeId });
   } catch (error) {
     res.status(500).send(error.message);
   }
 });
 
-// Menabung sampah
+app.post('/jualsampah', async (req, res) => {
+  try {
+      const { wasteTypeId, amount, note } = req.body;
+
+      // Validasi input
+      if (!wasteTypeId || amount == null || isNaN(amount) || amount <= 0) {
+          return res.status(400).send("Jenis sampah dan jumlah sampah yang valid wajib diisi.");
+      }
+
+      if (!note || typeof note !== 'string') {
+          return res.status(400).send("Catatan wajib diisi dengan format teks yang valid.");
+      }
+
+      // Ambil data jenis sampah dari koleksi 'jumlah_sampah'
+      const wasteAmountRef = db.collection('jumlah_sampah').doc(wasteTypeId);
+      const wasteAmountDoc = await wasteAmountRef.get();
+
+      if (!wasteAmountDoc.exists) {
+          return res.status(404).send("Jenis sampah tidak ditemukan.");
+      }
+
+      const wasteAmountData = wasteAmountDoc.data();
+      const currentAmount = wasteAmountData.totalAmount;
+
+      // Periksa apakah jumlah sampah cukup untuk dikurangi
+      if (currentAmount < amount) {
+          return res.status(400).send("Jumlah sampah tidak mencukupi untuk pengurangan.");
+      }
+
+      // Kurangi jumlah sampah
+      const newAmount = currentAmount - amount;
+      await wasteAmountRef.update({
+          totalAmount: newAmount
+      });
+
+      const currentDate = moment().tz('Asia/Jakarta').format();
+
+      // Simpan data pengurangan ke koleksi 'waste_reductions'
+      await db.collection('waste_reductions').add({
+          wasteTypeId: wasteTypeId,
+          amount: amount,
+          note: note,
+          date: currentDate
+      });
+
+      res.status(201).send({ message: "Jual/setor sampah berhasil", newAmount: newAmount });
+
+  } catch (error) {
+      res.status(500).send(error.message);
+  }
+});
+
 app.post('/tabung', async (req, res) => {
   try {
       const { name, date, deposits } = req.body;
@@ -594,8 +706,29 @@ app.post('/tabung', async (req, res) => {
           return res.status(400).send("Semua data wajib diisi.");
       }
 
+      // Ambil data nasabah untuk mendapatkan nomor telepon
+      const nasabahRef = db.collection('nasabah').where('name', '==', name);
+      const nasabahSnapshot = await nasabahRef.get();
+
+      if (nasabahSnapshot.empty) {
+          return res.status(404).send("Nasabah tidak ditemukan.");
+      }
+
+      let phoneNumber;
+      nasabahSnapshot.forEach(doc => {
+          phoneNumber = doc.data().phoneNumber;
+      });
+
+      if (!phoneNumber) {
+          return res.status(400).send("Nomor telepon nasabah tidak ditemukan.");
+      }
+
       // Membuat variabel untuk total saldo
       let totalBalance = 0;
+
+      // Membuat objek untuk menyimpan jumlah sampah berdasarkan jenis dan nama jenis sampah
+      let wasteAmounts = {};
+      let wasteNames = {};
 
       // Iterasi melalui setiap entri deposit
       for (const tabung of deposits) {
@@ -603,33 +736,42 @@ app.post('/tabung', async (req, res) => {
 
           // Validasi input untuk setiap entri deposit
           if (!wasteTypeId || amount == null || isNaN(amount) || amount <= 0) {
-              return res.status(400).send("Setidaknya tabung 1 jenis sampah dengan jumlah yang valid.");
+              return res.status(400).send("Setidaknya masukkan 1 jenis sampah dengan jumlah yang valid.");
           }
 
-          // Dapatkan harga per 100 gram dari jenis sampah yang sesuai
-          const wasteTypeDoc = await db.collection('waste_types').doc(wasteTypeId).get();
+          // Dapatkan harga per 100 gram dan nama dari jenis sampah yang sesuai
+          const wasteTypeDoc = await db.collection('jenis_sampah').doc(wasteTypeId).get();
           if (!wasteTypeDoc.exists) {
               return res.status(404).send(`Jenis sampah ${wasteTypeId} tidak ada.`);
           }
 
           const wasteTypeData = wasteTypeDoc.data();
-          const pricePer100Gram = wasteTypeData.pricePerGram;
+          const pricePer100Gram = wasteTypeData.pricePer100Gram;
+          const wasteTypeName = wasteTypeData.name;
 
           // Konversi jumlah dari kg ke 100 gram dan hitung total saldo untuk jenis sampah ini
           const amountInHundredGrams = (amount * 1000) / 100;
           totalBalance += pricePer100Gram * amountInHundredGrams;
+
+          // Tambahkan jumlah ke wasteAmounts dan nama jenis sampah ke wasteNames
+          if (wasteAmounts[wasteTypeId]) {
+              wasteAmounts[wasteTypeId] += amount;
+          } else {
+              wasteAmounts[wasteTypeId] = amount;
+              wasteNames[wasteTypeId] = wasteTypeName;
+          }
       }
 
-      // Simpan data transaksi ke koleksi 'transactions' di Firestore
-      const newTransactionRef = await db.collection('transactions').add({
+      // Simpan data transaksi ke koleksi 'transaksi' di Firestore
+      const newTransactionRef = await db.collection('transaksi').add({
           name: name,
           date: date,
           deposits: deposits,
           totalBalance: totalBalance
       });
 
-      // Update atau tambahkan data nasabah ke koleksi 'datasaving' di Firestore
-      const customerRef = db.collection('datasaving').doc(name);
+      // Update atau tambahkan data nasabah ke koleksi 'saldo_nasabah' di Firestore
+      const customerRef = db.collection('saldo_nasabah').doc(name);
       const customerDoc = await customerRef.get();
 
       if (customerDoc.exists) {
@@ -646,22 +788,494 @@ app.post('/tabung', async (req, res) => {
           });
       }
 
-      res.status(201).send({ message: "Berhasil menabung sampah", transactionId: newTransactionRef.id });
+      // Update jumlah sampah berdasarkan jenis di koleksi 'jumlah_sampah'
+      for (const wasteTypeId in wasteAmounts) {
+          const wasteAmount = wasteAmounts[wasteTypeId];
+          const wasteAmountRef = db.collection('jumlah_sampah').doc(wasteTypeId);
+          const wasteAmountDoc = await wasteAmountRef.get();
+
+          if (wasteAmountDoc.exists) {
+              // Jika data jenis sampah sudah ada, update jumlahnya
+              const existingAmount = wasteAmountDoc.data().totalAmount || 0;
+              await wasteAmountRef.update({
+                  totalAmount: existingAmount + wasteAmount
+              });
+          } else {
+              // Jika data jenis sampah belum ada, tambahkan data baru
+              await wasteAmountRef.set({
+                  wasteTypeId: wasteTypeId,
+                  totalAmount: wasteAmount
+              });
+          }
+      }
+
+      // Mengirim WhatsApp nota elektronik
+      const message = `
+*Menabung Sampah Berhasil*
+------------------------------
+Anda telah berhasil menabung sampah dengan rincian sebagai berikut:
+
+*Nama:* ${name}
+*Tanggal:* ${moment().tz('Asia/Jakarta').format('DD-MM-YYYY HH:mm:ss')}
+*Deposit:* 
+${Object.keys(wasteAmounts).map(wasteTypeId => `- Jenis Sampah: ${wasteNames[wasteTypeId]}, Jumlah: ${wasteAmounts[wasteTypeId]} kg`).join('\n')}
+
+------------------------------
+*Saldo Masuk:* Rp${totalBalance.toLocaleString('id-ID')}
+------------------------------
+
+-- Terimakasih sudah menabung di bank sampah WasteApp --
+`;
+
+      await client.messages.create({
+          from: 'whatsapp:' + process.env.TWILIO_WHATSAPP_SANDBOX_NUMBER,
+          to: 'whatsapp:' + phoneNumber,
+          body: message
+      });
+
+      res.status(201).send({ message: "Berhasil menabung sampah dan nota elektronik telah dikirimkan melalui WhatsApp", transactionId: newTransactionRef.id });
 
   } catch (error) {
       res.status(500).send(error.message);
   }
 });
 
+// Menabung sampah via email
+// app.post('/tabung', async (req, res) => {
+//   try {
+//       const { name, date, deposits } = req.body;
 
+//       // Validasi input dasar
+//       if (!name || !date || !deposits || !Array.isArray(deposits) || deposits.length === 0) {
+//           return res.status(400).send("Semua data wajib diisi.");
+//       }
+
+//       // Ambil data nasabah untuk mendapatkan email
+//       const nasabahRef = db.collection('nasabah').where('name', '==', name);
+//       const nasabahSnapshot = await nasabahRef.get();
+
+//       if (nasabahSnapshot.empty) {
+//           return res.status(404).send("Nasabah tidak ditemukan.");
+//       }
+
+//       let email;
+//       nasabahSnapshot.forEach(doc => {
+//           email = doc.data().email;
+//       });
+
+//       if (!email) {
+//           return res.status(400).send("Email nasabah tidak ditemukan.");
+//       }
+
+//       // Membuat variabel untuk total saldo
+//       let totalBalance = 0;
+
+//       // Membuat objek untuk menyimpan jumlah sampah berdasarkan jenis dan nama jenis sampah
+//       let wasteAmounts = {};
+//       let wasteNames = {};
+
+//       // Iterasi melalui setiap entri deposit
+//       for (const tabung of deposits) {
+//           const { wasteTypeId, amount } = tabung;
+
+//           // Validasi input untuk setiap entri deposit
+//           if (!wasteTypeId || amount == null || isNaN(amount) || amount <= 0) {
+//               return res.status(400).send("Setidaknya masukkan 1 jenis sampah dengan jumlah yang valid.");
+//           }
+
+//           // Dapatkan harga per 100 gram dan nama dari jenis sampah yang sesuai
+//           const wasteTypeDoc = await db.collection('jenis_sampah').doc(wasteTypeId).get();
+//           if (!wasteTypeDoc.exists) {
+//               return res.status(404).send(`Jenis sampah ${wasteTypeId} tidak ada.`);
+//           }
+
+//           const wasteTypeData = wasteTypeDoc.data();
+//           const pricePer100Gram = wasteTypeData.pricePer100Gram;
+//           const wasteTypeName = wasteTypeData.name;
+
+//           // Konversi jumlah dari kg ke 100 gram dan hitung total saldo untuk jenis sampah ini
+//           const amountInHundredGrams = (amount * 1000) / 100;
+//           totalBalance += pricePer100Gram * amountInHundredGrams;
+
+//           // Tambahkan jumlah ke wasteAmounts dan nama jenis sampah ke wasteNames
+//           if (wasteAmounts[wasteTypeId]) {
+//               wasteAmounts[wasteTypeId] += amount;
+//           } else {
+//               wasteAmounts[wasteTypeId] = amount;
+//               wasteNames[wasteTypeId] = wasteTypeName;
+//           }
+//       }
+
+//       // Simpan data transaksi ke koleksi 'transaksi' di Firestore
+//       const newTransactionRef = await db.collection('transaksi').add({
+//           name: name,
+//           date: date,
+//           deposits: deposits,
+//           totalBalance: totalBalance
+//       });
+
+//       // Update atau tambahkan data nasabah ke koleksi 'saldo_nasabah' di Firestore
+//       const customerRef = db.collection('saldo_nasabah').doc(name);
+//       const customerDoc = await customerRef.get();
+
+//       if (customerDoc.exists) {
+//           // Jika nasabah sudah ada, update total saldo
+//           const existingBalance = customerDoc.data().totalBalance || 0;
+//           await customerRef.update({
+//               totalBalance: existingBalance + totalBalance
+//           });
+//       } else {
+//           // Jika nasabah belum ada, tambahkan data nasabah baru
+//           await customerRef.set({
+//               name: name,
+//               totalBalance: totalBalance
+//           });
+//       }
+
+//       // Update jumlah sampah berdasarkan jenis di koleksi 'jumlah_sampah'
+//       for (const wasteTypeId in wasteAmounts) {
+//           const wasteAmount = wasteAmounts[wasteTypeId];
+//           const wasteAmountRef = db.collection('jumlah_sampah').doc(wasteTypeId);
+//           const wasteAmountDoc = await wasteAmountRef.get();
+
+//           if (wasteAmountDoc.exists) {
+//               // Jika data jenis sampah sudah ada, update jumlahnya
+//               const existingAmount = wasteAmountDoc.data().totalAmount || 0;
+//               await wasteAmountRef.update({
+//                   totalAmount: existingAmount + wasteAmount
+//               });
+//           } else {
+//               // Jika data jenis sampah belum ada, tambahkan data baru
+//               await wasteAmountRef.set({
+//                   wasteTypeId: wasteTypeId,
+//                   totalAmount: wasteAmount
+//               });
+//           }
+//       }
+
+//       // Mengirim email nota elektronik
+//       let transporter = nodemailer.createTransport({
+//           service: 'hotmail',
+//           auth: {
+//               user: process.env.EMAIL_SECRET_KEY,
+//               pass: process.env.PASS_SECRET_KEY
+//           }
+//       });
+
+//       let mailOptions = {
+//           from: process.env.EMAIL_SECRET_KEY,
+//           to: email,
+//           subject: 'Nota Menabung Sampah - WasteApp',
+//           html: `<h2>Menabung Sampah Berhasil</h2>
+//                  <p>--------------------------------------------------------------------------------------------------------------------------------</p> 
+//                  <p>Anda berhasil menabung sampah dengan rincian sebagai berikut.</p>
+//                  <table>
+//                  <tbody>
+//                  <tr><td>Nama</td><td>:</td><td>${name}</td></tr>
+//                  <tr><td>Tanggal</td><td>:</td><td>${date}</td></tr>
+//                  <tr><td>Deposit</td><td>:</td><td><ul>
+//                    ${Object.keys(wasteAmounts).map(wasteTypeId => `<li>Jenis Sampah: ${wasteNames[wasteTypeId]}, Jumlah: ${wasteAmounts[wasteTypeId]} kg</li>`).join('')}
+//                  </ul></td></tr>
+//                  </tbody>
+//                  </table>
+//                  <p>--------------------------------------------------------------------------------------------------------------------------------</p>
+//                  <p><b>Saldo Masuk   : ${totalBalance}</b><p>
+//                  <p>-- Terimakasih sudah menabung di bank sampah WasteApp -- </p>`
+//       };
+
+//       await transporter.sendMail(mailOptions);
+
+//       res.status(201).send({ message: "Berhasil menabung sampah dan nota elektronik telah dikirimkan", transactionId: newTransactionRef.id });
+
+//   } catch (error) {
+//       res.status(500).send(error.message);
+//   }
+// });
+
+app.get('/stoksampah', async (req, res) => {
+  try {
+      // Ambil semua data dari koleksi 'jumlah_sampah'
+      const jumlahSampahSnapshot = await db.collection('jumlah_sampah').get();
+      if (jumlahSampahSnapshot.empty) {
+          return res.status(404).send("Tidak ada data di koleksi jumlah_sampah.");
+      }
+
+      // Buat array untuk menampung data
+      let jumlahSampahData = [];
+      jumlahSampahSnapshot.forEach(doc => {
+          jumlahSampahData.push({ id: doc.id, ...doc.data() });
+      });
+
+      res.status(200).send(jumlahSampahData);
+  } catch (error) {
+      res.status(500).send(error.message);
+  }
+});
+
+app.get('/totalstoksampah', async (req, res) => {
+  try {
+      // Ambil semua data dari koleksi 'jumlah_sampah'
+      const jumlahSampahSnapshot = await db.collection('jumlah_sampah').get();
+      if (jumlahSampahSnapshot.empty) {
+          return res.status(404).send("Tidak ada data di koleksi jumlah_sampah.");
+      }
+
+      // Hitung total stok sampah
+      let totalStokSampah = 0;
+      jumlahSampahSnapshot.forEach(doc => {
+          const data = doc.data();
+          if (data.totalAmount && !isNaN(data.totalAmount)) {
+              totalStokSampah += data.totalAmount;
+          }
+      });
+
+      res.status(200).send({ totalStokSampah });
+  } catch (error) {
+      res.status(500).send(error.message);
+  }
+});
+
+app.get('/stoksampahkeluar', async (req, res) => {
+  try {
+      // Ambil semua data dari koleksi 'waste_reductions'
+      const wasteReductionsSnapshot = await db.collection('waste_reductions').get();
+      if (wasteReductionsSnapshot.empty) {
+          return res.status(404).send("Tidak ada data di koleksi waste_reductions.");
+      }
+
+      // Buat array untuk menampung data
+      let wasteReductionsData = [];
+      wasteReductionsSnapshot.forEach(doc => {
+          wasteReductionsData.push({ id: doc.id, ...doc.data() });
+      });
+
+      res.status(200).send(wasteReductionsData);
+  } catch (error) {
+      res.status(500).send(error.message);
+  }
+});
+
+app.post('/tariksaldo', async (req, res) => {
+  try {
+    const { name, amount, note } = req.body;
+
+    // Validasi input
+    if (!name || amount == null || isNaN(amount) || amount <= 0) {
+      return res.status(400).send("Nama nasabah dan jumlah penarikan yang valid wajib diisi.");
+    }
+
+    if (!note || typeof note !== 'string') {
+      return res.status(400).send("Catatan wajib diisi dengan format teks yang valid.");
+    }
+
+    // Ambil data nasabah dari koleksi 'saldo_nasabah'
+    const customerRef = db.collection('saldo_nasabah').doc(name);
+    const customerDoc = await customerRef.get();
+
+    if (!customerDoc.exists) {
+      return res.status(404).send("Nasabah tidak ditemukan.");
+    }
+
+    const customerData = customerDoc.data();
+    const currentBalance = customerData.totalBalance;
+
+    // Periksa apakah saldo cukup untuk penarikan
+    if (currentBalance < amount) {
+      return res.status(400).send("Saldo tidak mencukupi untuk penarikan.");
+    }
+
+    // Kurangi saldo nasabah
+    const newBalance = currentBalance - amount;
+    await customerRef.update({
+      totalBalance: newBalance
+    });
+
+    const currentDate = moment().tz('Asia/Jakarta').format();
+
+    // Simpan data penarikan ke koleksi 'saldo_keluar'
+    await db.collection('saldo_keluar').add({
+      name: name,
+      amount: amount,
+      note: note,
+      date: currentDate
+    });
+
+    // Ambil data nasabah untuk mendapatkan nomor telepon
+    const nasabahRef = db.collection('nasabah').where('name', '==', name);
+    const nasabahSnapshot = await nasabahRef.get();
+
+    if (nasabahSnapshot.empty) {
+      return res.status(404).send("Nasabah tidak ditemukan.");
+    }
+
+    let phoneNumber;
+    nasabahSnapshot.forEach(doc => {
+      phoneNumber = doc.data().phoneNumber; // Pastikan field untuk nomor telepon adalah 'phoneNumber'
+    });
+
+    if (!phoneNumber) {
+      return res.status(400).send("Nomor telepon nasabah tidak ditemukan.");
+    }
+
+    // Mengirim WhatsApp nota penarikan saldo
+    const message = `
+    *Tarik Saldo Berhasil*
+    ------------------------------
+    Anda telah berhasil melakukan tarik saldo dengan rincian sebagai berikut:
+
+    *Nama:* ${name}
+    *Tanggal:* ${moment().tz('Asia/Jakarta').format('DD-MM-YYYY HH:mm:ss')}
+    *Jumlah Penarikan:* Rp${amount.toLocaleString('id-ID')}
+    *Catatan:* ${note}
+
+    ------------------------------
+    *Sisa Saldo:* Rp${newBalance.toLocaleString('id-ID')}
+    ------------------------------
+
+    -- Terimakasih --
+    `;
+
+    await client.messages.create({
+      from: 'whatsapp:' + process.env.TWILIO_WHATSAPP_SANDBOX_NUMBER,
+      to: 'whatsapp:' + phoneNumber,
+      body: message
+    });
+
+    res.status(201).send({ message: "Penarikan saldo berhasil dan nota elektronik telah dikirimkan melalui WhatsApp", newBalance: newBalance });
+
+  } catch (error) {
+    res.status(500).send(error.message);
+  }
+});
+
+//TARIK SALDO VIA EMAIL
+// app.post('/tariksaldo', async (req, res) => {
+//   try {
+//       const { name, amount, note } = req.body;
+
+//       // Validasi input
+//       if (!name || amount == null || isNaN(amount) || amount <= 0) {
+//           return res.status(400).send("Nama nasabah dan jumlah penarikan yang valid wajib diisi.");
+//       }
+
+//       if (!note || typeof note !== 'string') {
+//           return res.status(400).send("Catatan wajib diisi dengan format teks yang valid.");
+//       }
+
+//       // Ambil data nasabah dari koleksi 'saldo_nasabah'
+//       const customerRef = db.collection('saldo_nasabah').doc(name);
+//       const customerDoc = await customerRef.get();
+
+//       if (!customerDoc.exists) {
+//           return res.status(404).send("Nasabah tidak ditemukan.");
+//       }
+
+//       const customerData = customerDoc.data();
+//       const currentBalance = customerData.totalBalance;
+
+//       // Periksa apakah saldo cukup untuk penarikan
+//       if (currentBalance < amount) {
+//           return res.status(400).send("Saldo tidak mencukupi untuk penarikan.");
+//       }
+
+//       // Kurangi saldo nasabah
+//       const newBalance = currentBalance - amount;
+//       await customerRef.update({
+//           totalBalance: newBalance
+//       });
+
+//       const currentDate = moment().tz('Asia/Jakarta').format();
+
+//       // Simpan data penarikan ke koleksi 'saldo_keluar'
+//       const withdrawalRef = await db.collection('saldo_keluar').add({
+//           name: name,
+//           amount: amount,
+//           note: note,
+//           date: currentDate
+//       });
+
+//       // Ambil data nasabah untuk mendapatkan email
+//       const nasabahRef = db.collection('nasabah').where('name', '==', name);
+//       const nasabahSnapshot = await nasabahRef.get();
+
+//       if (nasabahSnapshot.empty) {
+//           return res.status(404).send("Nasabah tidak ditemukan.");
+//       }
+
+//       let email;
+//       nasabahSnapshot.forEach(doc => {
+//           email = doc.data().email;
+//       });
+
+//       if (!email) {
+//           return res.status(400).send("Email nasabah tidak ditemukan.");
+//       }
+
+//       // Mengirim email nota penarikan saldo
+//       let transporter = nodemailer.createTransport({
+//           service: 'hotmail',
+//           auth: {
+//               user: process.env.EMAIL_SECRET_KEY,
+//               pass: process.env.PASS_SECRET_KEY
+//           }
+//       });
+
+//       let mailOptions = {
+//           from: process.env.EMAIL_SECRET_KEY,
+//           to: email,
+//           subject: 'Nota Penarikan Saldo - WasteApp',
+//           html: <h2>Tarik Saldo Berhasil</h2>
+//                  <p>--------------------------------------------------------------------------------------------------------------------------------</p>
+//                  <p>Anda telah berhasil Tarik Saldo dengan rincian sebagai berikut.</p>
+//                  <table>
+//                  <tbody>
+//                  <tr><td>Nama</td><td>:</td><td>${name}</td></tr>
+//                  <tr><td>Tanggal</td><td>:</td><td>${new Date().toISOString()}</td></tr>
+//                  <tr><td>Jumlah Penarikan</td><td>:</td><td>${amount}</td></tr>
+//                  <tr><td>Catatan</td><td>:</td><td>${note}</td></tr>
+//                  </tbody>
+//                  </table>
+//                  <p>--------------------------------------------------------------------------------------------------------------------------------</p>
+//                  <p><b>Sisa Saldo        : ${newBalance}</b><p>
+//                  <p>-- Terimakasih -- </p>
+//       };
+
+//       await transporter.sendMail(mailOptions);
+
+//       res.status(201).send({ message: "Penarikan saldo berhasil dan nota elektronik telah dikirimkan", newBalance: newBalance });
+
+//   } catch (error) {
+//       res.status(500).send(error.message);
+//   }
+// });
+
+app.get('/saldokeluar', async (req, res) => {
+  try {
+      // Ambil semua data dari koleksi 'saldo_keluar'
+      const saldoKeluarSnapshot = await db.collection('saldo_keluar').get();
+      if (saldoKeluarSnapshot.empty) {
+          return res.status(404).send("Tidak ada data di koleksi saldo_keluar.");
+      }
+
+      // Buat array untuk menampung data
+      let saldoKeluarData = [];
+      saldoKeluarSnapshot.forEach(doc => {
+          saldoKeluarData.push({ id: doc.id, ...doc.data() });
+      });
+
+      res.status(200).send(saldoKeluarData);
+  } catch (error) {
+      res.status(500).send(error.message);
+  }
+});
 
 app.get('/saldo', async (req, res) => {
   try {
-    const saldoRef = db.collection('datasaving');
+    const saldoRef = db.collection('saldo_nasabah');
     const snapshot = await saldoRef.get();
 
     if (snapshot.empty) {
-      return res.status(404).send("Tidak ada saldo.");
+      return res.status(404).send("Tidak ditemukan data saldo nasabah.");
     }
 
     let saldo = [];
@@ -677,15 +1291,38 @@ app.get('/saldo', async (req, res) => {
   }
 });
 
+app.get('/totalsaldo', async (req, res) => {
+  try {
+      const saldoRef = db.collection('saldo_nasabah');
+      const snapshot = await saldoRef.get();
+
+      if (snapshot.empty) {
+          return res.status(404).send("Tidak ditemukan data saldo nasabah.");
+      }
+
+      let totalSaldo = 0;
+      snapshot.forEach(doc => {
+          const customerData = doc.data();
+          if (customerData.totalBalance && !isNaN(customerData.totalBalance)) {
+              totalSaldo += customerData.totalBalance;
+          }
+      });
+
+      res.status(200).send({ totalSaldo });
+  } catch (error) {
+      res.status(500).send(error.message);
+  }
+});
+
 //Mendapatkan data tabung
 app.get('/tabung', async (req, res) => {
   try {
     // Mengambil semua data transaksi dari koleksi 'transactions'
-    const transactionsRef = db.collection('transactions');
+    const transactionsRef = db.collection('transaksi');
     const snapshot = await transactionsRef.get();
 
     if (snapshot.empty) {
-      return res.status(404).send("Tidak ada data tabung.");
+      return res.status(404).send("Tidak ditemukan data transaksi menabung.");
     }
 
     let transactions = [];
@@ -702,17 +1339,64 @@ app.get('/tabung', async (req, res) => {
   }
 });
 
+// app.get('/rekapantransaksi', async (req, res) => {
+//   try {
+//     const { period } = req.query;
+//     const transactionsRef = db.collection('transaksi');
+//     const snapshot = await transactionsRef.get();
+
+//     if (snapshot.empty) {
+//       return res.status(404).send("Tidak ditemukan data transaksi menabung.");
+//     }
+
+//     let startDate;
+//     const today = moment().startOf('day');
+//     const startOfWeek = moment().startOf('week');
+//     const startOfMonth = moment().startOf('month');
+
+//     if (period === 'today') {
+//       startDate = today;
+//     } else if (period === 'week') {
+//       startDate = startOfWeek;
+//     } else if (period === 'month') {
+//       startDate = startOfMonth;
+//     } else {
+//       return res.status(400).send("Parameter periode tidak valid. Gunakan 'today', 'week', atau 'month'.");
+//     }
+
+//     let totalAmount = 0;
+
+//     snapshot.forEach(doc => {
+//       const transactionData = doc.data();
+//       const transactionDate = moment(transactionData.date, 'DD/MM/YYYY');
+
+//       if (transactionDate.isSameOrAfter(startDate)) {
+//         totalAmount += transactionData.amount;
+//       }
+//     });
+
+//     const response = {
+//       period,
+//       totalAmount,
+//     };
+
+//     res.status(200).send(response);
+//   } catch (error) {
+//     res.status(500).send(error.message);
+//   }
+// });
+
 // Mendapatkan detail data dari riwayat tabung
 app.get('/tabung/:id', async (req, res) => {
   try {
     const transactionId = req.params.id;
 
     // Ambil data transaksi berdasarkan ID
-    const transactionRef = db.collection('transactions').doc(transactionId);
+    const transactionRef = db.collection('transaksi').doc(transactionId);
     const transactionDoc = await transactionRef.get();
 
     if (!transactionDoc.exists) {
-      return res.status(404).send("Tidak ada data tabung.");
+      return res.status(404).send("Tidak ditemukan data transaksi ini.");
     }
 
     let transactionData = transactionDoc.data();
