@@ -165,6 +165,70 @@ app.post('/auth/logout', verifyToken, async (req, res) => {
   }
 });
 
+app.post('/midtrans-callback', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const midtransSignatureKey = process.env.MIDTRANS_SERVER_KEY; // Make sure to set this in your environment variables
+    const receivedJson = req.body.toString();
+    const receivedSignature = req.headers['x-signature'];
+
+    // Validate the signature
+    const expectedSignature = crypto
+      .createHash('sha512')
+      .update(receivedJson + midtransSignatureKey)
+      .digest('hex');
+
+    if (receivedSignature !== expectedSignature) {
+      return res.status(403).json({ status: 'error', message: 'Invalid signature' });
+    }
+
+    // Parse the JSON body
+    const transaction = JSON.parse(receivedJson);
+
+    // Process the transaction based on its status
+    switch (transaction.transaction_status) {
+      case 'capture':
+      case 'settlement':
+        if (transaction.fraud_status === 'accept') {
+          // Payment success, update your database
+          await updateTransactionStatus(transaction.order_id, 'success', transaction);
+        }
+        break;
+      case 'deny':
+      case 'cancel':
+      case 'expire':
+        // Payment failed, update your database
+        await updateTransactionStatus(transaction.order_id, 'failed', transaction);
+        break;
+      case 'pending':
+        // Payment pending, update your database
+        await updateTransactionStatus(transaction.order_id, 'pending', transaction);
+        break;
+    }
+
+    // Return a 200 OK response to acknowledge receipt of the notification
+    res.status(200).json({ status: 'ok' });
+  } catch (error) {
+    console.error('Error processing Midtrans callback:', error);
+    res.status(500).json({ status: 'error', message: 'Internal server error' });
+  }
+});
+
+// Helper function to update transaction status in your database
+async function updateTransactionStatus(orderId, status, transactionData) {
+  try {
+    const transactionRef = db.collection('transactions').doc(orderId);
+    await transactionRef.update({
+      status: status,
+      midtransResponse: transactionData,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    console.log(`Transaction ${orderId} updated to ${status}`);
+  } catch (error) {
+    console.error(`Error updating transaction ${orderId}:`, error);
+  }
+}
+
+
 // Endpoint untuk Memperbarui Token
 app.post('/auth/token', async (req, res) => {
   const { token } = req.body;
